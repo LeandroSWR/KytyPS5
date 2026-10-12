@@ -5,11 +5,13 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "kernel/pthread.h"
 #include "loader/symbolDatabase.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <new>
 
@@ -88,6 +90,9 @@ static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reserved) == 52);
 static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
+static std::atomic<int32_t> g_hmd_handle {0};
+
+constexpr int32_t HMD_HANDLE = 0x0f000001;
 
 ReprojectionState* GetReprojectionState() {
 	return g_reprojection_state.load(std::memory_order_acquire);
@@ -212,6 +217,148 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableVrMode(uint64_t output_mode) 
 	return OK;
 }
 
+// sceHmd2Open
+static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t index,
+                                       const void* param) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = %p\n",
+	     user_id, type, index, param);
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INITIALIZED;
+	}
+	int32_t expected = 0;
+	g_hmd_handle.compare_exchange_strong(expected, HMD_HANDLE);
+	const auto handle = g_hmd_handle.load();
+	LOGF("Hmd2: open handle=%d\n", handle);
+	return handle;
+}
+
+// sceHmd2ReprojectionBeginFrame
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(uint64_t handle) {
+	PRINT_NAME();
+	LOGF("\t handle = 0x%" PRIx64 "\n", handle);
+	return OK;
+}
+
+static bool GuestPointer(uint64_t value) {
+	// Guest allocations start at 8 GiB. Handles, including the virtual headset, stay below that.
+	return value >= 0x200000000ull;
+}
+
+static uint64_t* PredictedTimeOutput(uint64_t arg0, uint64_t arg1) {
+	if (GuestPointer(arg1)) {
+		return reinterpret_cast<uint64_t*>(arg1);
+	}
+	if (GuestPointer(arg0)) {
+		return reinterpret_cast<uint64_t*>(arg0);
+	}
+	return nullptr;
+}
+
+// sceHmd2ReprojectionGetPredictedDisplayTime
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(uint64_t arg0, uint64_t arg1) {
+	PRINT_NAME();
+	auto* out = PredictedTimeOutput(arg0, arg1);
+	uint64_t frame_us = 11111;
+	if (const auto* state = GetReprojectionState();
+	    state != nullptr && state->output_mode.load() == OUTPUT_MODE_119_88HZ) {
+		frame_us = 8333;
+	}
+	const auto predicted = LibKernel::KernelGetProcessTime() + frame_us;
+	LOGF("\t arg0 = 0x%" PRIx64 "\n"
+	     "\t arg1 = 0x%" PRIx64 "\n"
+	     "\t time = %" PRIu64 "\n",
+	     arg0, arg1, predicted);
+	if (out != nullptr) {
+		*out = predicted;
+	}
+	return OK;
+}
+
+// hA9LshbSkzw. Called once during headset setup. The symbol name is not identified yet.
+static int32_t KYTY_SYSV_ABI Hmd2UnknownHA9LshbSkzw(uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                                    uint64_t arg3) {
+	PRINT_NAME();
+	LOGF("\t hA9LshbSkzw args = (0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+	     arg0, arg1, arg2, arg3);
+	return OK;
+}
+
+static void* LastGuestPointer(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+	void* found = nullptr;
+	for (const uint64_t value : {arg0, arg1, arg2}) {
+		if (GuestPointer(value)) {
+			found = reinterpret_cast<void*>(value);
+		}
+	}
+	return found;
+}
+
+static bool DeclaredStructSize(const void* value, uint32_t* size) {
+	if (value == nullptr) {
+		return false;
+	}
+	const auto declared = *static_cast<const uint32_t*>(value);
+	if (declared < 8 || declared > 512 || declared % 4 != 0) {
+		return false;
+	}
+	*size = declared;
+	return true;
+}
+
+// sceHmd2GazeGetResult. Writes only when the caller prefixed the result with its size.
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+	auto* result       = LastGuestPointer(arg0, arg1, arg2);
+	uint32_t declared  = 0;
+	const auto sized   = DeclaredStructSize(result, &declared);
+	LOGF("\t arg0     = 0x%" PRIx64 "\n"
+	     "\t arg1     = 0x%" PRIx64 "\n"
+	     "\t arg2     = 0x%" PRIx64 "\n"
+	     "\t declared = %u\n",
+	     arg0, arg1, arg2, declared);
+	if (!sized) {
+		return OK;
+	}
+	auto* bytes            = static_cast<uint8_t*>(result);
+	const auto preserved   = *reinterpret_cast<uint32_t*>(bytes);
+	std::memset(bytes, 0, declared);
+	*reinterpret_cast<uint32_t*>(bytes) = preserved;
+	if (declared >= 8) {
+		*reinterpret_cast<int32_t*>(bytes + 4) = 1;
+	}
+	if (declared >= 16) {
+		*reinterpret_cast<uint64_t*>(bytes + 8) = LibKernel::KernelGetProcessTime();
+	}
+	// size, status, timestamp, then a forward gaze in head space.
+	if (declared >= 28) {
+		*reinterpret_cast<float*>(bytes + 24) = -1.0f;
+	}
+	return OK;
+}
+
+// sceHmd2ReprojectionSetParam. Per-frame companion of GetPredictedDisplayTime.
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+	LOGF("\t arg0 = 0x%" PRIx64 "\n"
+	     "\t arg1 = 0x%" PRIx64 "\n"
+	     "\t arg2 = 0x%" PRIx64 "\n",
+	     arg0, arg1, arg2);
+	return OK;
+}
+
+// retc+-uRMhk. The symbol name is not identified yet.
+static int32_t KYTY_SYSV_ABI Hmd2UnknownRetc(uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                             uint64_t arg3) {
+	PRINT_NAME();
+	LOGF("\t retc+-uRMhk args = (0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+	     arg0, arg1, arg2, arg3);
+	return OK;
+}
+
 static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 	auto* state = GetReprojectionState();
 	if (state == nullptr) {
@@ -235,6 +382,13 @@ LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("C0rPwER-yxg", Hmd2::Hmd2ReprojectionInitialize);
 	LIB_FUNC("VVvFh51o20s", Hmd2::Hmd2ReprojectionEnableVrMode);
 	LIB_FUNC("FkQX7rjFomk", Hmd2::Hmd2ReprojectionSetTiming);
+	LIB_FUNC("f3kPeoTZnIE", Hmd2::Hmd2Open);
+	LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
+	LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
+	LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2UnknownHA9LshbSkzw);
+	LIB_FUNC("lAoFUedcfqA", Hmd2::Hmd2GazeGetResult);
+	LIB_FUNC("xMo9ENEu2E0", Hmd2::Hmd2ReprojectionSetParam);
+	LIB_FUNC("retc+-uRMhk", Hmd2::Hmd2UnknownRetc);
 }
 
 } // namespace Libs
