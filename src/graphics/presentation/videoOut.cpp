@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -26,6 +27,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -177,6 +180,7 @@ struct BufferAttributeGroup {
 	VideoOutBufferAttribute2 attribute {};
 	int                      category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
 	bool                     occupied = false;
+	bool                     linear   = false;
 
 	[[nodiscard]] Graphics::ImageInfo ImageInfo(const VideoOutBuffer& buffer) const;
 };
@@ -212,7 +216,7 @@ public:
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
 	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-	             uint64_t& request_id);
+	             uint64_t& request_id, bool present_blank = false);
 	void Cancel(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
@@ -237,6 +241,7 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		bool                        present_blank = false;
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -524,7 +529,8 @@ static int PresentationLayer(int bus_type) {
 }
 
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
-                              int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
+                              int64_t flip_arg, FlipRequestSource source, uint64_t& request_id,
+                              bool present_blank = false) {
 	auto* video_out = driver.Get(handle);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -542,10 +548,11 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
 	}
 	if (video_out->closing ||
-	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
+	    (!present_blank && !IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
-	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
+	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id,
+	                                   present_blank)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
 	return OK;
@@ -569,7 +576,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
 	}
-	const auto          tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
+	const auto tile_mode = linear ? Graphics::Prospero::TileMode::kLinear
+	                              : Graphics::Prospero::TileMode::kRenderTarget;
 	Graphics::ImageInfo info {};
 	info.data            = {buffer.data_address, 0};
 	info.pixel_format    = pixel_format.format;
@@ -582,8 +590,10 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.tile_mode       = tile_mode;
 	info.bgra16          = pixel_format.bgra16;
 	info.UpdateSize();
-	if (info.data.size == 0 || info.tiling.block.block_size != 65536 ||
-	    (buffer.data_address & 65535u) != 0) {
+	const auto address_aligned =
+	    linear ? (buffer.data_address & 255u) == 0 : (buffer.data_address & 65535u) == 0;
+	if (info.data.size == 0 || !address_aligned ||
+	    (!linear && info.tiling.block.block_size != 65536)) {
 		EXIT("invalid video-out surface footprint or alignment\n");
 	}
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
@@ -648,6 +658,7 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
 	if (bus == VIDEO_OUT_BUSES.end()) {
+		std::printf("VideoOutOpen: unsupported bus_type=%d index=%d\n", bus_type, index);
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
@@ -933,7 +944,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 }
 
 bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-                        uint64_t& request_id) {
+                        uint64_t& request_id, bool present_blank) {
 	Common::LockGuard lock(m_mutex);
 
 	// A newer slave request replaces the one not yet captured by a master flip.
@@ -971,8 +982,9 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.index      = index;
 	r.flip_arg   = flip_arg;
 	r.submit_ptc = LibKernel::KernelGetProcessTimeCounter();
-	r.source     = source;
-	r.state      = RequestState::Reserved;
+	r.source        = source;
+	r.state         = RequestState::Reserved;
+	r.present_blank = present_blank;
 	if (cfg.slave_count != 0) {
 		for (auto* queue: {&m_requests, &m_cpu_requests}) {
 			for (auto& slave: *queue) {
@@ -1048,7 +1060,8 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
-	int             index      = 0;
+	int             index         = 0;
+	bool            present_blank = false;
 	{
 		Common::LockGuard lock(m_mutex);
 		auto request = std::find_if(m_requests.begin(), m_requests.end(),
@@ -1077,9 +1090,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		cfg            = request->cfg;
 		generation     = request->generation;
 		index          = request->index;
+		present_blank  = request->present_blank;
 	}
 
-	const bool          special = IsSpecialBufferIndex(index);
+	const bool          special = present_blank || IsSpecialBufferIndex(index);
 	Graphics::ImageInfo source_info;
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
@@ -1427,6 +1441,150 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+static uint64_t MappedTail(const void* address) {
+	if (address == nullptr) {
+		return 0;
+	}
+	void* start = nullptr;
+	void* end   = nullptr;
+	if (LibKernel::Memory::KernelQueryMemoryProtection(const_cast<void*>(address), &start, &end,
+	                                                   nullptr) != OK ||
+	    end == nullptr) {
+		return 0;
+	}
+	const auto begin = reinterpret_cast<uintptr_t>(address);
+	const auto limit = reinterpret_cast<uintptr_t>(end);
+	return limit > begin ? static_cast<uint64_t>(limit - begin) : 0;
+}
+
+// A display surface is a guest allocation of at least 1 MiB. Headset registration can hand us
+// the surface itself or a small descriptor that points at it.
+static bool HeadsetSurfacePointer(uint64_t value) {
+	return value >= 0x200000000ull && (value & 255u) == 0 &&
+	       MappedTail(reinterpret_cast<const void*>(value)) >= (1ull << 20);
+}
+
+static const void* HeadsetPixelAddress(const void* data, int depth) {
+	const auto mapped = MappedTail(data);
+	if (HeadsetSurfacePointer(reinterpret_cast<uintptr_t>(data))) {
+		return data;
+	}
+	if (data == nullptr || mapped < sizeof(uint64_t) || depth > 3) {
+		std::printf("VideoOutRegisterBuffers2: headset object=%p mapped=%" PRIu64 "\n", data,
+		            mapped);
+		return nullptr;
+	}
+	const auto words = std::min<uint64_t>(8, mapped / sizeof(uint64_t));
+	std::printf("VideoOutRegisterBuffers2: headset object=%p mapped=%" PRIu64 " words", data,
+	            mapped);
+	const void* nested = nullptr;
+	for (uint64_t i = 0; i < words; ++i) {
+		uint64_t word = 0;
+		std::memcpy(&word, static_cast<const uint8_t*>(data) + i * sizeof(uint64_t),
+		            sizeof(word));
+		std::printf(" %016" PRIx64, word);
+		if (word < 0x200000000ull) {
+			continue;
+		}
+		if (HeadsetSurfacePointer(word)) {
+			std::printf("\nVideoOutRegisterBuffers2: headset pixel=%p from object+%u\n",
+			            reinterpret_cast<void*>(word), static_cast<unsigned>(i * sizeof(uint64_t)));
+			return reinterpret_cast<const void*>(word);
+		}
+		const auto child = MappedTail(reinterpret_cast<void*>(word));
+		std::printf("(map=%" PRIu64 ")", child);
+		if (nested == nullptr && child >= sizeof(uint64_t)) {
+			nested = reinterpret_cast<const void*>(word);
+		}
+	}
+	std::printf("\n");
+	return nested != nullptr ? HeadsetPixelAddress(nested, depth + 1) : nullptr;
+}
+
+// PSVR2 registers the headset swapchain with a zeroed attribute and lets the port supply
+// the panel size. A 64 KiB aligned address is a tiled render target. A 256-byte aligned
+// address is a linear surface; tiled color blocks cannot start on that alignment.
+static bool HeadsetDisplayAttribute(const void* data, uint64_t available,
+                                    VideoOutBufferAttribute2& attribute, bool& linear) {
+	linear = false;
+	if (data == nullptr || available == 0) {
+		std::printf("VideoOutRegisterBuffers2: headset buffer data=%p available=%" PRIu64
+		            " is not mapped\n",
+		            data, available);
+		return false;
+	}
+	const auto address = reinterpret_cast<uintptr_t>(data);
+	const bool tiled   = (address & 65535u) == 0;
+	if (!tiled && (address & 255u) != 0) {
+		std::printf("VideoOutRegisterBuffers2: headset buffer data=%p is not display-aligned\n",
+		            data);
+		return false;
+	}
+	struct Candidate {
+		uint32_t                         width;
+		uint32_t                         height;
+		uint64_t                         format;
+		Graphics::Prospero::BufferFormat guest;
+	};
+	const Candidate candidates[] = {
+	    {Hmd2::PANEL_WIDTH, Hmd2::PANEL_HEIGHT, 0x8100000022000000ull,
+	     Graphics::Prospero::BufferFormat::k10_10_10_2UNorm},
+	    {Hmd2::PANEL_WIDTH, Hmd2::PANEL_HEIGHT, 0xc001000622000000ull,
+	     Graphics::Prospero::BufferFormat::k16_16_16_16Float},
+	    {Hmd2::PANEL_WIDTH / 2, Hmd2::PANEL_HEIGHT, 0x8100000022000000ull,
+	     Graphics::Prospero::BufferFormat::k10_10_10_2UNorm},
+	    {Hmd2::PANEL_WIDTH / 2, Hmd2::PANEL_HEIGHT, 0xc001000622000000ull,
+	     Graphics::Prospero::BufferFormat::k16_16_16_16Float},
+	    {3840, 2160, 0x8100000022000000ull, Graphics::Prospero::BufferFormat::k10_10_10_2UNorm},
+	    {Hmd2::PANEL_WIDTH, Hmd2::PANEL_HEIGHT, 0x8000000022000000ull,
+	     Graphics::Prospero::BufferFormat::k8_8_8_8Srgb},
+	};
+	for (const auto& candidate: candidates) {
+		uint64_t footprint = 0;
+		if (tiled) {
+			Graphics::TileSurfaceLayout layout {};
+			const Graphics::TileSurfaceDescription description {
+			    candidate.guest,
+			    Graphics::Prospero::TileMode::kRenderTarget,
+			    Graphics::TileSurfaceDimension::Dim2D,
+			    candidate.width,
+			    candidate.height,
+			    1,
+			    1,
+			    1,
+			};
+			if (!Graphics::TileGetTiledTextureLayout(description, layout)) {
+				continue;
+			}
+			footprint = layout.total_size;
+		} else {
+			Graphics::TileSizeAlign size {};
+			Graphics::TileGetTextureTotalSize(candidate.guest, candidate.width, candidate.height, 1,
+			                                  1, Graphics::Prospero::TileMode::kLinear, false, size);
+			footprint = size.size;
+		}
+		if (footprint == 0 || footprint > available) {
+			continue;
+		}
+		attribute.width          = candidate.width;
+		attribute.height         = candidate.height;
+		attribute.pixel_format   = candidate.format;
+		attribute.pitch_in_pixel = 0;
+		attribute.tiling_mode    = 0;
+		attribute.aspect_ratio   = 0;
+		linear                   = !tiled;
+		std::printf("VideoOutRegisterBuffers2: headset surface %ux%u format=0x%" PRIx64
+		            " footprint=%" PRIu64 " available=%" PRIu64 " %s\n",
+		            candidate.width, candidate.height, candidate.format, footprint, available,
+		            linear ? "linear" : "tiled");
+		return true;
+	}
+	std::printf("VideoOutRegisterBuffers2: headset buffer data=%p available=%" PRIu64
+	            " matches no panel size\n",
+	            data, available);
+	return false;
+}
+
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
@@ -1467,31 +1625,83 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	std::printf("VideoOutRegisterBuffers2: handle=%d start=%d count=%d %ux%u format=0x%" PRIx64
+	            " category=%d option=%p\n",
+	            handle, buffer_index_start, buffer_num, attribute->width, attribute->height,
+	            attribute->pixel_format, category, option);
+
+	auto attribute_copy = *attribute;
+	auto category_used  = category;
+	if (category_used != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
+	    category_used != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
+		std::printf("VideoOutRegisterBuffers2: handle=%d category=%d treated as uncompressed\n",
+		            handle, category_used);
+		category_used = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
+	}
+	bool                         headset_linear = false;
+	std::vector<VideoOutBuffers> headset_buffers;
+	const VideoOutBuffers*       buffer_view = buffers;
+	if (ctx->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN &&
+	    (attribute_copy.width == 0 || attribute_copy.height == 0 ||
+	     attribute_copy.pixel_format == 0)) {
+		headset_buffers.assign(buffers, buffers + buffer_num);
+		for (int i = 0; i < buffer_num; i++) {
+			auto& entry = headset_buffers[static_cast<size_t>(i)];
+			std::printf("VideoOutRegisterBuffers2: headset slot %d data=%p metadata=%p "
+			            "reserved=%p,%p\n",
+			            i, entry.data, entry.metadata, entry.reserved[0], entry.reserved[1]);
+			const void* pixel = nullptr;
+			for (const void* candidate: {entry.data, entry.metadata, entry.reserved[0],
+			                             entry.reserved[1]}) {
+				if (HeadsetSurfacePointer(reinterpret_cast<uintptr_t>(candidate))) {
+					pixel = candidate;
+					break;
+				}
+			}
+			if (pixel == nullptr) {
+				pixel = HeadsetPixelAddress(entry.data, 0);
+			}
+			if (pixel == nullptr) {
+				std::printf("VideoOutRegisterBuffers2: headset slot %d has no surface\n", i);
+				return VIDEO_OUT_ERROR_INVALID_VALUE;
+			}
+			std::printf("VideoOutRegisterBuffers2: headset slot %d pixel=%p mapped=%" PRIu64 "\n",
+			            i, pixel, MappedTail(pixel));
+			entry.data = pixel;
+		}
+		buffer_view = headset_buffers.data();
+		if (!HeadsetDisplayAttribute(buffer_view[0].data, MappedTail(buffer_view[0].data),
+		                             attribute_copy, headset_linear)) {
+			return VIDEO_OUT_ERROR_INVALID_VALUE;
+		}
+	}
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
-	if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
-	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
+	if (category_used != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
+	    category_used != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
 	}
 
 	BufferAttributeGroup group {
-	    .attribute = *attribute,
-	    .category  = category,
+	    .attribute = attribute_copy,
+	    .category  = category_used,
 	    .occupied  = true,
+	    .linear    = headset_linear,
 	};
 	std::vector<VideoOutBuffer> registrations;
 	registrations.reserve(static_cast<size_t>(buffer_num));
 
 	for (int i = 0; i < buffer_num; i++) {
-		LOGF("\t buffers[%d]: data=%p metadata=%p\n", i, buffers[i].data, buffers[i].metadata);
-		if (buffers[i].reserved[0] != nullptr || buffers[i].reserved[1] != nullptr) {
-			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i, buffers[i].reserved[0],
-			     buffers[i].reserved[1]);
+		LOGF("\t buffers[%d]: data=%p metadata=%p\n", i, buffer_view[i].data,
+		     buffer_view[i].metadata);
+		if (buffer_view[i].reserved[0] != nullptr || buffer_view[i].reserved[1] != nullptr) {
+			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i,
+			     buffer_view[i].reserved[0], buffer_view[i].reserved[1]);
 		}
-		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
-		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
+		const auto data_address     = reinterpret_cast<uint64_t>(buffer_view[i].data);
+		const auto metadata_address = reinterpret_cast<uint64_t>(buffer_view[i].metadata);
 		registrations.push_back({
 		    .group_index      = set_index,
 		    .data_address     = data_address,
@@ -1519,8 +1729,11 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		const auto& buffer                   = registrations[static_cast<size_t>(i)];
 		LOGF("\tbuffers[%d] = %016" PRIx64 " metadata = %016" PRIx64 " dcc = %08" PRIx32 "\n",
 		     buffer_index_start + i, buffer.data_address, buffer.metadata_address,
-		     attribute->dcc_control);
+		     attribute_copy.dcc_control);
 	}
+	std::printf("VideoOutRegisterBuffers2: registered handle=%d bus=%d start=%d count=%d %ux%u\n",
+	            handle, ctx->bus, buffer_index_start, buffer_num, attribute_copy.width,
+	            attribute_copy.height);
 
 	return OK;
 }
@@ -1616,8 +1829,27 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
 	EXIT_IF(buffer.IsInvalid());
 
-	const int result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
-	                                      FlipRequestSource::GpuEop, request_id);
+	int result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
+	                                FlipRequestSource::GpuEop, request_id);
+	// The headset port can be flipped before its swapchain is registered. Keep the frame
+	// loop alive with a blank present instead of treating that as a fatal GPU fault.
+	if (result == VIDEO_OUT_ERROR_INVALID_INDEX && !IsSpecialBufferIndex(index)) {
+		auto* port = m_impl->Get(handle);
+		if (port != nullptr && port->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				int occupied = 0;
+				for (const auto& slot: port->buffers) {
+					occupied += slot.Occupied() ? 1 : 0;
+				}
+				std::printf("VideoOut: headset flip index %d has no buffer (%d slots registered); "
+				            "presenting blank\n",
+				            index, occupied);
+			}
+			result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
+			                            FlipRequestSource::GpuEop, request_id, true);
+		}
+	}
 	if (result != OK) {
 		return result;
 	}
