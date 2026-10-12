@@ -6,6 +6,7 @@
 #include "libs/padData.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstddef>
 #include <cstring>
 
 namespace Libs {
@@ -147,6 +148,94 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	return Controller::PadCheckHandle(handle);
 }
 
+// scePadVrControllerReadState. Compact Sense controller report: one stick, trigger, grip,
+// then the same motion block the DualSense report uses.
+struct VrControllerData {
+	uint32_t buttons;
+	uint8_t  stick_x;
+	uint8_t  stick_y;
+	uint8_t  analog_trigger;
+	uint8_t  analog_grip;
+	uint8_t  reserved0[2];
+	float    orientation_x;
+	float    orientation_y;
+	float    orientation_z;
+	float    orientation_w;
+	float    acceleration_x;
+	float    acceleration_y;
+	float    acceleration_z;
+	float    angular_velocity_x;
+	float    angular_velocity_y;
+	float    angular_velocity_z;
+	uint32_t reserved1;
+	uint64_t timestamp;
+	uint8_t  connected;
+	uint8_t  connected_count;
+	uint8_t  reserved2[6];
+};
+
+static_assert(sizeof(VrControllerData) == 72);
+static_assert(offsetof(VrControllerData, orientation_x) == 12);
+static_assert(offsetof(VrControllerData, acceleration_x) == 28);
+static_assert(offsetof(VrControllerData, angular_velocity_x) == 40);
+static_assert(offsetof(VrControllerData, timestamp) == 56);
+static_assert(offsetof(VrControllerData, connected) == 64);
+
+static int KYTY_SYSV_ABI PadVrControllerReadState(int handle, VrControllerData* data) {
+	PRINT_NAME();
+	LOGF("\t handle = %d\n"
+	     "\t data   = %p\n",
+	     handle, static_cast<void*>(data));
+
+	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
+	if (data == nullptr) {
+		return pad_error_invalid_arg;
+	}
+
+	VrControllerData out {};
+	out.orientation_w = 1.0f;
+	out.stick_x       = 0x80;
+	out.stick_y       = 0x80;
+
+	Controller::PadData pad {};
+	if (Controller::PadReadState(handle, &pad) == OK) {
+		out.buttons           = pad.buttons;
+		out.stick_x           = pad.left_stick_x;
+		out.stick_y           = pad.left_stick_y;
+		out.analog_trigger    = pad.analog_buttons_l2;
+		out.analog_grip       = pad.analog_buttons_r2;
+		out.orientation_x     = pad.orientation_x;
+		out.orientation_y     = pad.orientation_y;
+		out.orientation_z     = pad.orientation_z;
+		out.orientation_w     = pad.orientation_w;
+		out.acceleration_x    = pad.acceleration_x;
+		out.acceleration_y    = pad.acceleration_y;
+		out.acceleration_z    = pad.acceleration_z;
+		out.angular_velocity_x = pad.angular_velocity_x;
+		out.angular_velocity_y = pad.angular_velocity_y;
+		out.angular_velocity_z = pad.angular_velocity_z;
+		out.timestamp         = pad.timestamp;
+		out.connected         = pad.connected ? 1 : 0;
+		out.connected_count   = pad.connected_count;
+		if (out.orientation_x == 0.0f && out.orientation_y == 0.0f && out.orientation_z == 0.0f &&
+		    out.orientation_w == 0.0f) {
+			out.orientation_w = 1.0f;
+		}
+	}
+
+	*data = out;
+	return OK;
+}
+
+// scePadVrControllerSetTriggerEffects
+static int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int handle, const void* param) {
+	PRINT_NAME();
+	LOGF("\t handle = %d\n"
+	     "\t param  = %p\n",
+	     handle, param);
+	return Controller::PadCheckHandle(handle);
+}
+
 static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
                                                uint64_t arg3, uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
@@ -189,6 +278,8 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
 	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
+	LIB_FUNC("iA-DdobUen8", PadVrControllerReadState);
+	LIB_FUNC("v8P+9PRqg10", PadVrControllerSetTriggerEffects);
 }
 
 namespace LibMouse {
