@@ -19,6 +19,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
@@ -49,6 +50,7 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+constexpr int      VIDEO_OUT_BUS_TYPE_HMD2_MAIN                         = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
@@ -60,6 +62,8 @@ constexpr size_t   VIDEO_OUT_FLIP_QUEUE_CAPACITY                        = 16;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX                   = 4;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT                        = 0x0000000000000001ULL;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_119_88HZ                       = 0x000000000000000FULL;
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_HMD2_89_91HZ                   = Hmd2::OUTPUT_MODE_89_91HZ;
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_HMD2_119_88HZ                  = Hmd2::OUTPUT_MODE_119_88HZ;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
@@ -250,7 +254,8 @@ private:
 struct VideoOutDriver::Impl {
 public:
 	static constexpr std::array VIDEO_OUT_BUSES {
-	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB,
+	    VIDEO_OUT_BUS_TYPE_HMD2_MAIN};
 	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -513,6 +518,11 @@ static bool IsValidFlipMode(int mode) {
 	       mode == VIDEO_OUT_FLIP_MODE_SLAVE || mode == VIDEO_OUT_FLIP_MODE_MASTER;
 }
 
+// The window composites a main image and one overlay. Headset and sub ports share the main image.
+static int PresentationLayer(int bus_type) {
+	return bus_type == VIDEO_OUT_BUS_TYPE_OVERLAY ? 1 : 0;
+}
+
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
                               int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
 	auto* video_out = driver.Get(handle);
@@ -737,7 +747,18 @@ bool VideoOutDriver::Impl::Close(int handle) {
 		master->slave_count--;
 	}
 	m_flip_queue.Cancel(config);
-	m_presenter.ClearLayer(config.bus);
+	const int layer  = PresentationLayer(config.bus);
+	bool      shared = false;
+	for (int other = 1; other < VIDEO_OUT_NUM_MAX; other++) {
+		if (other != handle && m_video_out_ctx[other].opened &&
+		    PresentationLayer(m_video_out_ctx[other].bus) == layer) {
+			shared = true;
+			break;
+		}
+	}
+	if (!shared) {
+		m_presenter.ClearLayer(layer);
+	}
 	DeleteVideoOutEvents(flip_events, VideoOutEventKind::Flip);
 	DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
 	DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
@@ -1238,7 +1259,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		layers[i] = {r.frame, PresentationLayer(r.cfg->bus), r.premultiplied_alpha};
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
@@ -1860,7 +1881,8 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
-	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
+	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ &&
+	    mode != VIDEO_OUT_OUTPUT_MODE_HMD2_89_91HZ && mode != VIDEO_OUT_OUTPUT_MODE_HMD2_119_88HZ) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 
