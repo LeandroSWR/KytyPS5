@@ -46,7 +46,21 @@ struct Latest {
 	int           index = -1;
 	uint64_t      tick  = 0;
 	vk::Semaphore semaphore;
+	VrPose        head; // The head pose the game last read, so the picture can be placed in the world.
 };
+
+// Hamilton product and rotation, for placing the eye poses relative to the head.
+XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) {
+	return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+	        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v) {
+	const XrVector3f t {2.0f * (q.y * v.z - q.z * v.y), 2.0f * (q.z * v.x - q.x * v.z),
+	                    2.0f * (q.x * v.y - q.y * v.x)};
+	return {v.x + q.w * t.x + (q.y * t.z - q.z * t.y), v.y + q.w * t.y + (q.z * t.x - q.x * t.z),
+	        v.z + q.w * t.z + (q.x * t.y - q.y * t.x)};
+}
 
 struct State {
 	XrInstance instance = XR_NULL_HANDLE;
@@ -102,6 +116,7 @@ struct State {
 	std::mutex        input_mutex;
 	VrControllerInput input[2];
 	VrPose            head;
+	VrPose            last_head_read; // The head pose most recently handed to the game.
 };
 
 State g;
@@ -270,6 +285,19 @@ bool CreateEyeSwapchains(vk::Extent2D eye) {
 bool RenderEyes(const Latest& snapshot, VulkanImage& source) {
 	auto&    device = g.graphics->device;
 	uint32_t index[2] {};
+
+	// The copy is queued behind the game's own work on the same queue. If it waited on the GPU for a
+	// tick the game has not submitted yet, it would sit in front of that submit and block it for
+	// good. So wait for the tick on the CPU first, and skip this frame if it is not there yet.
+	{
+		vk::SemaphoreWaitInfo wait_info {};
+		wait_info.semaphoreCount = 1;
+		wait_info.pSemaphores    = &snapshot.semaphore;
+		wait_info.pValues        = &snapshot.tick;
+		if (device.waitSemaphores(&wait_info, 30'000'000) != vk::Result::eSuccess) {
+			return false;
+		}
+	}
 	for (int eye = 0; eye < 2; eye++) {
 		XrSwapchainImageAcquireInfo acquire {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 		{
@@ -651,7 +679,22 @@ void ThreadMain() {
 					                                          static_cast<int32_t>(g.eye_extent.height)};
 					views[eye].subImage.imageArrayIndex    = 0;
 				}
-				layer.space     = g.space;
+				if (snapshot.head.valid) {
+					// The game drew this frame for the head pose it read, so the picture is placed in the
+					// world at that pose and the runtime reprojects it as the head keeps moving.
+					const XrQuaternionf head_q {snapshot.head.orientation[0], snapshot.head.orientation[1],
+					                            snapshot.head.orientation[2], snapshot.head.orientation[3]};
+					const XrVector3f    head_p {snapshot.head.position[0], snapshot.head.position[1],
+					                            snapshot.head.position[2]};
+					for (auto& view : views) {
+						const auto offset = Rotate(head_q, view.pose.position);
+						view.pose.position    = {head_p.x + offset.x, head_p.y + offset.y, head_p.z + offset.z};
+						view.pose.orientation = Multiply(head_q, view.pose.orientation);
+					}
+					layer.space = g.local_space;
+				} else {
+					layer.space = g.space;
+				}
 				layer.viewCount = 2;
 				layer.views     = views;
 				layers[0]       = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
@@ -875,6 +918,9 @@ bool OpenXrGetHeadPose(VrPose& out) {
 	}
 	std::lock_guard lock(g.input_mutex);
 	out = g.head;
+	if (out.valid) {
+		g.last_head_read = out;
+	}
 	return out.valid;
 }
 
@@ -925,6 +971,10 @@ void OpenXrQueueEyeSource(CommandBuffer& command, Image& source) {
 	g.latest.index      = index;
 	g.latest.tick       = scheduler.CurrentTick();
 	g.latest.semaphore  = scheduler.GetMasterSemaphore().Handle();
+	{
+		std::lock_guard input_lock(g.input_mutex);
+		g.latest.head = g.last_head_read;
+	}
 }
 
 } // namespace Libs::Vr
