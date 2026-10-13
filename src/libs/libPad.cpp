@@ -252,6 +252,12 @@ static int KYTY_SYSV_ABI PadVrControllerReadState(int handle, VrControllerData* 
 		} else {
 			buttons |= xr.primary ? Controller::PAD_BUTTON_CROSS : 0u;
 			buttons |= xr.secondary ? Controller::PAD_BUTTON_CIRCLE : 0u;
+			// The Options button sits on the right Sense controller, but the right Touch controller has
+			// no spare button, so the left Menu button stands in for it.
+			Vr::VrControllerInput left;
+			if (Vr::OpenXrGetController(0, left) && left.menu) {
+				buttons |= Controller::PAD_BUTTON_OPTIONS;
+			}
 		}
 		out.buttons        = buttons;
 		out.stick_x        = to_byte(xr.stick_x * 0.5f + 0.5f);
