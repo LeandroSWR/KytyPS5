@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/headsetPreview.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/memory.h"
@@ -1143,7 +1144,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		    "displaying PQ video-out pixels unchanged.\n");
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
-	if (special) {
+	// VR only: the headset port, and the main port once the game has produced headset frames,
+	// show the latest eye image so it is visible in the window without a headset.
+	Graphics::ImageInfo preview_info;
+	const bool          show_preview =
+	    Graphics::HeadsetPreviewEnabled() &&
+	    (present_blank || cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN ||
+	     cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN) &&
+	    Graphics::HeadsetPreviewGet(preview_info);
+	if (show_preview) {
+		frame = &m_presenter.PrepareFrame(buffer, preview_info, false);
+	} else if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {

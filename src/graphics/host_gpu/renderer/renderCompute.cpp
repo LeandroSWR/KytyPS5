@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/headsetPreview.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -348,6 +349,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	for (size_t i = 0; HeadsetPreviewEnabled() && i < program.info.images.size(); i++) {
+		if (program.info.images[i].written) {
+			HeadsetPreviewNote(m_context.GetTextureCache().GetImage(bindings.images[i].image_id).info);
+		}
+	}
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
