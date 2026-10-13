@@ -6,6 +6,9 @@
 #include "libs/padData.h"
 #include "loader/symbolDatabase.h"
 
+#include "graphics/presentation/vrInput.h"
+
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 
@@ -221,6 +224,48 @@ static int KYTY_SYSV_ABI PadVrControllerReadState(int handle, VrControllerData* 
 		    out.orientation_w == 0.0f) {
 			out.orientation_w = 1.0f;
 		}
+	}
+
+	// With a headset the Quest controllers drive the VR controller ports; without one the keyboard
+	// or gamepad state read above is kept.
+	const int hand = Controller::VrHandForHandle(handle);
+	Vr::VrControllerInput xr;
+	if (Vr::OpenXrGetController(hand, xr)) {
+		constexpr float press = 0.5f;
+		const auto      to_byte = [](float value) {
+            return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+		};
+		uint32_t buttons = 0;
+		if (xr.trigger > press) {
+			buttons |= hand == 0 ? Controller::PAD_BUTTON_L2 : Controller::PAD_BUTTON_R2;
+		}
+		if (xr.squeeze > press) {
+			buttons |= hand == 0 ? Controller::PAD_BUTTON_L1 : Controller::PAD_BUTTON_R1;
+		}
+		if (xr.stick_click) {
+			buttons |= hand == 0 ? Controller::PAD_BUTTON_L3 : Controller::PAD_BUTTON_R3;
+		}
+		if (hand == 0) {
+			buttons |= xr.primary ? Controller::PAD_BUTTON_SQUARE : 0u;
+			buttons |= xr.secondary ? Controller::PAD_BUTTON_TRIANGLE : 0u;
+			buttons |= xr.menu ? Controller::PAD_BUTTON_OPTIONS : 0u;
+		} else {
+			buttons |= xr.primary ? Controller::PAD_BUTTON_CROSS : 0u;
+			buttons |= xr.secondary ? Controller::PAD_BUTTON_CIRCLE : 0u;
+		}
+		out.buttons        = buttons;
+		out.stick_x        = to_byte(xr.stick_x * 0.5f + 0.5f);
+		out.stick_y        = to_byte(0.5f - xr.stick_y * 0.5f);
+		out.analog_trigger = to_byte(xr.trigger);
+		out.analog_grip    = to_byte(xr.squeeze);
+		if (xr.pose_valid) {
+			out.orientation_x = xr.orientation[0];
+			out.orientation_y = xr.orientation[1];
+			out.orientation_z = xr.orientation[2];
+			out.orientation_w = xr.orientation[3];
+		}
+		out.connected       = xr.connected ? 1 : 0;
+		out.connected_count = 2;
 	}
 
 	*data = out;

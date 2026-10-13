@@ -30,6 +30,11 @@ constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
 constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
 constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
 constexpr int PAD_HANDLE                = 1;
+// Virtual headset only: the left and right VR controller ports (port types 3 and 4).
+constexpr int PAD_PORT_TYPE_VR_LEFT     = 3;
+constexpr int PAD_PORT_TYPE_VR_RIGHT    = 4;
+constexpr int PAD_HANDLE_VR_LEFT        = 2;
+constexpr int PAD_HANDLE_VR_RIGHT       = 3;
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
@@ -154,6 +159,7 @@ private:
 
 	Common::Mutex    m_mutex;
 	PortState        m_port_state      = PortState::Uninitialized;
+	bool             m_vr_open[2]      = {false, false};
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
@@ -939,6 +945,18 @@ int GetActiveControllerId() {
 	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
 }
 
+static bool IsVrPortType(int type) {
+	return Config::VrEnabled() && (type == PAD_PORT_TYPE_VR_LEFT || type == PAD_PORT_TYPE_VR_RIGHT);
+}
+
+static bool IsVrHandle(int handle) {
+	return Config::VrEnabled() && (handle == PAD_HANDLE_VR_LEFT || handle == PAD_HANDLE_VR_RIGHT);
+}
+
+int VrHandForHandle(int handle) {
+	return IsVrHandle(handle) ? handle - PAD_HANDLE_VR_LEFT : -1;
+}
+
 static bool PadOpenArgsAreValid(int user_id, int type, int index) {
 	// The host keyboard and gamepad feed one standard port for the configured user.
 	return user_id == Config::GetUserId() && type == 0 && index == 0;
@@ -957,6 +975,14 @@ int GameController::OpenPort(int user_id, int type, int index) {
 	if (m_port_state == PortState::Uninitialized) {
 		return PAD_ERROR_NOT_INITIALIZED;
 	}
+	if (IsVrPortType(type) && index == 0) {
+		const int hand = type - PAD_PORT_TYPE_VR_LEFT;
+		if (m_vr_open[hand]) {
+			return PAD_ERROR_ALREADY_OPENED;
+		}
+		m_vr_open[hand] = true;
+		return PAD_HANDLE_VR_LEFT + hand;
+	}
 	if (!PadOpenArgsAreValid(user_id, type, index)) {
 		return PAD_ERROR_INVALID_ARG;
 	}
@@ -972,6 +998,10 @@ int GameController::GetPortHandle(int user_id, int type, int index) {
 	if (m_port_state == PortState::Uninitialized) {
 		return PAD_ERROR_NOT_INITIALIZED;
 	}
+	if (IsVrPortType(type) && index == 0) {
+		const int hand = type - PAD_PORT_TYPE_VR_LEFT;
+		return m_vr_open[hand] ? PAD_HANDLE_VR_LEFT + hand : PAD_ERROR_NO_HANDLE;
+	}
 	return m_port_state == PortState::Open && PadOpenArgsAreValid(user_id, type, index) ? PAD_HANDLE
 	                                                                               : PAD_ERROR_NO_HANDLE;
 }
@@ -979,6 +1009,9 @@ int GameController::GetPortHandle(int user_id, int type, int index) {
 int GameController::CheckPortHandleLocked(int handle) const {
 	if (m_port_state == PortState::Uninitialized) {
 		return PAD_ERROR_NOT_INITIALIZED;
+	}
+	if (IsVrHandle(handle)) {
+		return m_vr_open[handle - PAD_HANDLE_VR_LEFT] ? OK : PAD_ERROR_INVALID_HANDLE;
 	}
 	return m_port_state == PortState::Open && handle == PAD_HANDLE ? OK : PAD_ERROR_INVALID_HANDLE;
 }
@@ -992,6 +1025,10 @@ int GameController::ClosePort(int handle) {
 	Common::LockGuard lock(m_mutex);
 	if (const auto error = CheckPortHandleLocked(handle); error != OK) {
 		return error;
+	}
+	if (IsVrHandle(handle)) {
+		m_vr_open[handle - PAD_HANDLE_VR_LEFT] = false;
+		return OK;
 	}
 	m_port_state = PortState::Closed;
 	return OK;

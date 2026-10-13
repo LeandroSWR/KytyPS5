@@ -83,6 +83,9 @@ float GetSettingScale(Setting setting);
 
 int PadCheckHandle(int handle);
 
+// Virtual headset only: 0 for the left and 1 for the right VR controller handle, -1 otherwise.
+int VrHandForHandle(int handle);
+
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);
