@@ -25,12 +25,17 @@ constexpr uint32_t DEVICE_CONTROLLER_RIGHT = 3;
 constexpr uint32_t REQUEST_SIZE            = 0x30;
 
 // Pose result layout. The game reads a tracking state at +0x1C and +0x20 and, from them, decides
-// whether the position and orientation at +0x60 are usable. State 3 in both marks both as valid.
+// whether the position and orientation at +0x60 are usable. State 9 in both is the fully tracked
+// state and sets every validity bit. The byte at +0x54 holds the validity of the extra vectors.
 constexpr uint32_t RESULT_STATE_A_OFFSET = 0x1C;
 constexpr uint32_t RESULT_STATE_B_OFFSET = 0x20;
 constexpr uint32_t RESULT_POSE_OFFSET    = 0x60;
-constexpr uint32_t RESULT_STATE_VALID    = 3;
-constexpr uint32_t RESULT_MIN_SIZE       = 0x80;
+// More copies of the pose. The head pose the camera is built from is read from two further slots.
+constexpr uint32_t RESULT_PREDICTED_POSE_OFFSET = 0xA0;
+constexpr uint32_t RESULT_SECOND_POSE_OFFSET    = 0xE0;
+constexpr uint32_t RESULT_FLAGS_OFFSET   = 0x54;
+constexpr uint32_t RESULT_STATE_TRACKED  = 9;
+constexpr uint8_t  RESULT_FLAGS_VALID    = 3;
 
 // A pose as the game reads it back: position, padding, then the orientation quaternion (x, y, z, w).
 struct ResultPose {
@@ -71,10 +76,21 @@ static bool WritePose(const void* request, void* result) {
 			std::memcpy(pose.orientation, hand.orientation, sizeof(pose.orientation));
 		}
 	}
+	// The runtime reports quaternions with either sign; keep w positive so a rotation always has one
+	// representation.
+	if (pose.orientation[3] < 0.0f) {
+		for (auto& component : pose.orientation) {
+			component = -component;
+		}
+	}
+
 	auto* bytes = static_cast<uint8_t*>(result);
-	*reinterpret_cast<uint32_t*>(bytes + RESULT_STATE_A_OFFSET) = RESULT_STATE_VALID;
-	*reinterpret_cast<uint32_t*>(bytes + RESULT_STATE_B_OFFSET) = RESULT_STATE_VALID;
+	*reinterpret_cast<uint32_t*>(bytes + RESULT_STATE_A_OFFSET) = RESULT_STATE_TRACKED;
+	*reinterpret_cast<uint32_t*>(bytes + RESULT_STATE_B_OFFSET) = RESULT_STATE_TRACKED;
 	std::memcpy(bytes + RESULT_POSE_OFFSET, &pose, sizeof(pose));
+	std::memcpy(bytes + RESULT_PREDICTED_POSE_OFFSET, &pose, sizeof(pose));
+	std::memcpy(bytes + RESULT_SECOND_POSE_OFFSET, &pose, sizeof(pose));
+	bytes[RESULT_FLAGS_OFFSET] = RESULT_FLAGS_VALID;
 	return true;
 }
 
