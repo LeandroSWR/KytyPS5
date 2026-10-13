@@ -156,7 +156,7 @@ static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView*
 	}
 	// Virtual ER15 field of view: 55/42.5/51.2/51.2 degrees.
 	// These tangents describe that geometry, not bit-exact firmware output.
-	*fov = {1.4281480312f, 0.9163311720f, 1.2437491417f, 1.2437491417f};
+	*fov = {FOV_TAN_OUT, FOV_TAN_IN, FOV_TAN_TOP, FOV_TAN_BOTTOM};
 	LOGF("Hmd2: FOV tangents out=%f in=%f top=%f bottom=%f\n", fov->tanOut, fov->tanIn,
 	     fov->tanTop, fov->tanBottom);
 	return OK;

@@ -338,6 +338,10 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
+if(WIN32)
+	list(APPEND kyty_emulator_link_libraries OpenXR::openxr_loader)
+endif()
+
 # Linux system libraries.
 if(LINUX)
 	find_package(Threads REQUIRED)

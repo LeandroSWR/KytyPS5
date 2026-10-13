@@ -1153,7 +1153,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	     cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN) &&
 	    Graphics::HeadsetPreviewGet(preview_info);
 	if (show_preview) {
-		frame = &m_presenter.PrepareFrame(buffer, preview_info, false);
+		frame = &m_presenter.PrepareFrame(buffer, preview_info, false, true);
 	} else if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
